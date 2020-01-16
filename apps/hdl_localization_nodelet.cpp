@@ -7,7 +7,6 @@
 #include <pcl_ros/point_cloud.h>
 #include <tf_conversions/tf_eigen.h>
 #include <tf/transform_broadcaster.h>
-#include <tf2/LinearMath/Quaternion.h>
 #include <tf/transform_listener.h>
 #include <tf/transform_datatypes.h>
 
@@ -48,6 +47,9 @@ public:
 
     use_imu = private_nh.param<bool>("use_imu", true);
     invert_imu = private_nh.param<bool>("invert_imu", false);
+    sensor_frame = private_nh.param<std::string>("sensor_frame", "velodyne");
+    base_frame = private_nh.param<std::string>("base_frame", "base_link");
+    
     if(use_imu) {
       NODELET_INFO("enable imu-based prediction");
       imu_sub = mt_nh.subscribe("/gpsimu_driver/imu_data", 256, &HdlLocalizationNodelet::imu_callback, this);
@@ -57,7 +59,6 @@ public:
     initialpose_sub = nh.subscribe("/initialpose", 8, &HdlLocalizationNodelet::initialpose_callback, this);
 
     pose_pub = nh.advertise<nav_msgs::Odometry>("/odom", 5, false);
-    pose_pub_ = nh.advertise<nav_msgs::Odometry>("/odom_",5, false);
     aligned_pub = nh.advertise<sensor_msgs::PointCloud2>("/aligned_points", 5, false);
   }
 
@@ -66,6 +67,7 @@ private:
 
   void initialize_params() {
     // intialize scan matching method
+    
     double downsample_resolution = private_nh.param<double>("downsample_resolution", 0.1);
     std::string ndt_neighbor_search_method = private_nh.param<std::string>("ndt_neighbor_search_method", "DIRECT7");
 
@@ -97,13 +99,10 @@ private:
     // initialize pose estimator
     if(private_nh.param<bool>("specify_init_pose", true)) {
       NODELET_INFO("initialize pose estimator with specified parameters!!");
-      tf2::Quaternion initial_q;
-      initial_q.setRPY(0,0,200*3.14/180);
-      initial_q.normalize();
       pose_estimator.reset(new hdl_localization::PoseEstimator(registration,
         ros::Time::now(),
         Eigen::Vector3f(private_nh.param<double>("init_pos_x", 0.0), private_nh.param<double>("init_pos_y", 0.0), private_nh.param<double>("init_pos_z", 0.0)),
-        Eigen::Quaternionf(private_nh.param<double>("init_ori_w", initial_q.w()), private_nh.param<double>("init_ori_x", initial_q.x()), private_nh.param<double>("init_ori_y", initial_q.y()), private_nh.param<double>("init_ori_z", initial_q.z())),
+        Eigen::Quaternionf(private_nh.param<double>("init_ori_w", 1.0), private_nh.param<double>("init_ori_x", 0.0), private_nh.param<double>("init_ori_y", 0.0), private_nh.param<double>("init_ori_z", 0.0)),
         private_nh.param<double>("cool_time_duration", 0.5)
       ));
     }
@@ -159,7 +158,7 @@ private:
         const auto& acc = (*imu_iter)->linear_acceleration;
         const auto& gyro = (*imu_iter)->angular_velocity;
         double gyro_sign = invert_imu ? -1.0 : 1.0;
-        pose_estimator->predict((*imu_iter)->header.stamp, Eigen::Vector3f(-acc.y, acc.x, -9.8), gyro_sign * Eigen::Vector3f(gyro.x, gyro.y, gyro.z));
+        pose_estimator->predict((*imu_iter)->header.stamp, Eigen::Vector3f(acc.x, acc.y, acc.z), gyro_sign * Eigen::Vector3f(gyro.x, gyro.y, gyro.z));
       }
       imu_data.erase(imu_data.begin(), imu_iter);
     }
@@ -180,8 +179,6 @@ private:
     }
 
     publish_odometry(points_msg->header.stamp, pose_estimator->matrix());
-    //publish_odometry_(points_msg->header.stamp, pose_estimator->matrix());
-    //publish_odometry__(points_msg->header.stamp, pose_estimator->matrix()); 
  }
 
   /**
@@ -206,13 +203,6 @@ private:
     std::lock_guard<std::mutex> lock(pose_estimator_mutex);
     const auto& p = pose_msg->pose.pose.position;
     const auto& q = pose_msg->pose.pose.orientation;
-    ROS_INFO("%f",pose_msg->pose.pose.position.x);
-    ROS_INFO("%f",pose_msg->pose.pose.position.y);
-    ROS_INFO("%f",pose_msg->pose.pose.position.z);
-    ROS_INFO("%f",pose_msg->pose.pose.orientation.w);
-    ROS_INFO("%f",pose_msg->pose.pose.orientation.x);
-    ROS_INFO("%f",pose_msg->pose.pose.orientation.y);
-    ROS_INFO("%f",pose_msg->pose.pose.orientation.z);
     pose_estimator.reset(
           new hdl_localization::PoseEstimator(
             registration,
@@ -248,24 +238,22 @@ private:
    */
   void publish_odometry(const ros::Time& stamp, const Eigen::Matrix4f& pose) {
     // broadcast the transform over tf
-    geometry_msgs::TransformStamped odom_trans = matrix2transform(stamp, pose, "map", "velodyne");
-    tf::StampedTransform map_velodyne_trans;
-    tf::transformStampedMsgToTF(odom_trans, map_velodyne_trans);
+    geometry_msgs::TransformStamped odom_trans = matrix2transform(stamp, pose, "map", sensor_frame);
+    tf::StampedTransform map_sensor_trans;
+    tf::transformStampedMsgToTF(odom_trans, map_sensor_trans);
 
-    tf::StampedTransform footprint_velodyne_trans;
-    tf::Transform map_footprint_trans;
+    tf::StampedTransform base_sensor_frame;
+    tf::Transform map_base_trans;
 
     try{
-      listener.lookupTransform("/base_footprint", "/velodyne", ros::Time(0), footprint_velodyne_trans);
-      map_footprint_trans = map_velodyne_trans * footprint_velodyne_trans.inverse();
+      listener.lookupTransform(base_frame, sensor_frame, ros::Time(0), base_sensor_frame);
+      map_base_trans = map_sensor_trans * base_sensor_frame.inverse();
     }
     catch (tf::TransformException ex){
       ROS_ERROR("%s",ex.what());
       ros::Duration(1.0).sleep();
     }
-
-    //pose_broadcaster.sendTransform(odom_trans);
-    pose_broadcaster.sendTransform(tf::StampedTransform(map_footprint_trans, stamp, "/map", "/base_footprint"));
+    pose_broadcaster.sendTransform(tf::StampedTransform(map_base_trans, stamp, "map", base_frame));
 
     // publish the transform
     nav_msgs::Odometry odom;
@@ -277,59 +265,12 @@ private:
     odom.pose.pose.position.z = pose(2, 3);
     odom.pose.pose.orientation = odom_trans.transform.rotation;
 
-    odom.child_frame_id = "velodyne";
+    odom.child_frame_id = sensor_frame;
     odom.twist.twist.linear.x = 0.0;
     odom.twist.twist.linear.y = 0.0;
     odom.twist.twist.angular.z = 0.0;
 
     pose_pub.publish(odom);
-  }
-
-   void publish_odometry_(const ros::Time& stamp, const Eigen::Matrix4f& pose) {
-    // broadcast the transform over tf
-    geometry_msgs::TransformStamped odom_trans_ = matrix2transform(stamp, pose, "map", "odom");
-    pose_broadcaster_.sendTransform(odom_trans_);
-
-    // publish the transform
-    nav_msgs::Odometry odom;
-    odom.header.stamp = stamp;
-    odom.header.frame_id = "map";
-
-    odom.pose.pose.position.x = pose(0, 3);
-    odom.pose.pose.position.y = pose(1, 3);
-    odom.pose.pose.position.z = pose(2, 3);
-    odom.pose.pose.orientation = odom_trans_.transform.rotation;
-
-    odom.child_frame_id = "odom";
-    odom.twist.twist.linear.x = 0.0;
-    odom.twist.twist.linear.y = 0.0;
-    odom.twist.twist.angular.z = 0.0;
-
-    pose_pub_.publish(odom);
-  }
-
-
-   void publish_odometry__(const ros::Time& stamp, const Eigen::Matrix4f& pose) {
-    // broadcast the transform over tf
-    geometry_msgs::TransformStamped odom_trans__ = matrix2transform(stamp, pose, "map", "base_footprint");
-    pose_broadcaster__.sendTransform(odom_trans__);
-
-    // publish the transform
-    nav_msgs::Odometry odom;
-    odom.header.stamp = stamp;
-    odom.header.frame_id = "map";
-
-    odom.pose.pose.position.x = pose(0, 3);
-    odom.pose.pose.position.y = pose(1, 3);
-    odom.pose.pose.position.z = pose(2, 3);
-    odom.pose.pose.orientation = odom_trans__.transform.rotation;
-
-    odom.child_frame_id = "odom";
-    odom.twist.twist.linear.x = 0.0;
-    odom.twist.twist.linear.y = 0.0;
-    odom.twist.twist.angular.z = 0.0;
-
-    pose_pub_.publish(odom);
   }
 
   /**
@@ -370,17 +311,18 @@ private:
 
   bool use_imu;
   bool invert_imu;
+
+  std::string sensor_frame;
+  std::string base_frame;
+
   ros::Subscriber imu_sub;
   ros::Subscriber points_sub;
   ros::Subscriber globalmap_sub;
   ros::Subscriber initialpose_sub;
 
   ros::Publisher pose_pub;
-  ros::Publisher pose_pub_;
   ros::Publisher aligned_pub;
   tf::TransformBroadcaster pose_broadcaster;
-  tf::TransformBroadcaster pose_broadcaster_;
-  tf::TransformBroadcaster pose_broadcaster__;
 
   // imu input buffer
   std::mutex imu_data_mutex;
